@@ -1,0 +1,13 @@
+name = "deepseek_v4_pro"
+description = "Parallel worker using DeepSeek V4 Pro with high reasoning effort for difficult implementation, review, and analysis."
+model_provider = "deepseek"
+model = "deepseek-v4-pro"
+model_reasoning_effort = "high"
+model_context_window = 262144
+model_auto_compact_token_limit = 200000
+
+developer_instructions = """
+Act as a careful high-effort parallel worker.
+Use DeepSeek V4 Pro for complex implementation, review, debugging, and architecture analysis.
+Think deeply before changing files, verify assumptions against the repository, and return concise summaries with concrete file paths and remaining risks.
+"""

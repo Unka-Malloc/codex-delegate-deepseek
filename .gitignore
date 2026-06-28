@@ -1,0 +1,6 @@
+state/
+tmp/
+*.log
+*.jsonl
+*.final.txt
+node_modules/

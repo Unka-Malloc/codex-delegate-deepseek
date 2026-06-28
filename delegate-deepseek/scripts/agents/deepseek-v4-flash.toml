@@ -1,0 +1,13 @@
+name = "deepseek_v4_flash"
+description = "Parallel worker using DeepSeek V4 Flash for fast implementation, exploration, and analysis."
+model_provider = "deepseek"
+model = "deepseek-v4-flash"
+model_reasoning_effort = "high"
+model_context_window = 262144
+model_auto_compact_token_limit = 200000
+
+developer_instructions = """
+Act as a focused parallel worker.
+Use DeepSeek V4 Flash for fast, bounded implementation or analysis tasks.
+Keep summaries concise, include concrete file paths when relevant, and avoid taking over unrelated work.
+"""
