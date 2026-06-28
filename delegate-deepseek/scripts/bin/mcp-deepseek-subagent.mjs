@@ -11,7 +11,11 @@ const SERVICE_PORT = process.env.CODEX_DEEPSEEK_SERVICE_PORT || "4466";
 const SERVICE_BASE_URL = process.env.CODEX_DEEPSEEK_SERVICE_URL || `http://127.0.0.1:${SERVICE_PORT}/v1`;
 const FORK_SCRIPT = process.env.CODEX_DEEPSEEK_FORK_SCRIPT || path.join(CODEX_HOME, "bin", "delegate-deepseek-worker.mjs");
 const MODEL_PROVIDER = process.env.CODEX_DEEPSEEK_MODEL_PROVIDER || "deepseek";
-const BACKEND_START_SCRIPT = process.env.CODEX_DEEPSEEK_SERVICE_START_SCRIPT || path.join(CODEX_HOME, "bin", "start-deepseek-subagent-mcp-backend.ps1");
+const BACKEND_START_SCRIPT = process.env.CODEX_DEEPSEEK_SERVICE_START_SCRIPT || path.join(
+  CODEX_HOME,
+  "bin",
+  process.platform === "win32" ? "start-deepseek-subagent-mcp-backend.ps1" : "start-deepseek-subagent-mcp-backend.sh",
+);
 
 const SERVER_INFO = {
   name: "local-deepseek-subagent",

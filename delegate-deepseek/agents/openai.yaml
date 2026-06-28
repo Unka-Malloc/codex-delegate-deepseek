@@ -1,4 +1,4 @@
 interface:
   display_name: "Delegate DeepSeek"
   short_description: "Delegate Codex work to DeepSeek V4"
-  default_prompt: "Use $delegate-deepseek to start DeepSeek-V4-Flash subagent development."
+  default_prompt: "Use $delegate-deepseek to install and start macOS local DeepSeek V4 delegation."

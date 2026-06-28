@@ -9,17 +9,47 @@ description: Install, start, and dispatch DeepSeek-V4-Flash or DeepSeek-V4-Pro C
 
 When the user asks to install, repair, or start DeepSeek V4 delegation, run:
 
-```powershell
-& "$env:CODEX_HOME\skills\delegate-deepseek\scripts\install.ps1"
+```bash
+"${CODEX_HOME:-$HOME/.codex}/skills/delegate-deepseek/scripts/install.sh"
 ```
 
 If `CODEX_HOME` is unset, use:
 
-```powershell
-& "$env:USERPROFILE\.codex\skills\delegate-deepseek\scripts\install.ps1"
+```bash
+"$HOME/.codex/skills/delegate-deepseek/scripts/install.sh"
 ```
 
-The installer copies the bundled scripts into `$CODEX_HOME\bin`, installs the DeepSeek Flash/Pro agent definitions, configures `model_providers.deepseek` at `http://127.0.0.1:4466/v1`, registers `mcp_servers.deepseek_subagent`, and starts the local backend. It reads `DEEPSEEK_API_KEY` from the process or user environment and never writes keys into config files, arguments, transcripts, or logs.
+The installer copies the bundled scripts into `$CODEX_HOME/bin`, installs the DeepSeek Flash/Pro agent definitions, configures `model_providers.deepseek` at `http://127.0.0.1:4466/v1`, registers `mcp_servers.deepseek_subagent`, and starts the local backend. On macOS, read `DEEPSEEK_API_KEY` from the process environment or `launchctl getenv DEEPSEEK_API_KEY`; never write keys into config files, arguments, transcripts, or logs.
+
+For Codex Desktop on macOS, prefer setting the key in the launch environment before install:
+
+```bash
+launchctl setenv DEEPSEEK_API_KEY "..."
+```
+
+## Configuration
+
+Use Codex's native provider configuration for delegation. The installer writes
+these user-level entries to `$CODEX_HOME/config.toml`:
+
+- `[model_providers.deepseek]` with `base_url = "http://127.0.0.1:4466/v1"` and
+  `wire_api = "responses"`.
+- `[mcp_servers.deepseek_subagent]` for the MCP tool entry point and startup
+  environment.
+- `model_catalog_json` pointing at
+  `$CODEX_HOME/model-catalogs/delegate-deepseek.json`, a generated merge of the
+  current Codex catalog plus DeepSeek model metadata.
+
+Do not put `model_provider`, `model_providers`, `openai_base_url`, or
+credential-bearing provider settings in project-local `.codex/config.toml`.
+Codex treats those as user-level provider/auth settings. Keep
+`DEEPSEEK_API_KEY` in the environment or macOS launch environment and let the
+local backend adapt Codex Responses calls to DeepSeek upstream calls.
+
+If Codex prints `Unknown model deepseek-v4-flash is used`, regenerate and install
+the merged catalog by rerunning the installer. `model_catalog_json` is a full
+catalog override, so never replace it with a DeepSeek-only catalog unless the
+user explicitly wants to hide the built-in model catalog.
 
 ## Dispatch
 
@@ -33,16 +63,16 @@ Use `agent_type=deepseek_v4_flash` for fast parallel implementation or explorati
 
 If the MCP tool is not loaded in the current thread, use the bundled CLI fallback:
 
-```powershell
-& "$env:CODEX_HOME\bin\spawn-deepseek-subagent.ps1" --agent-type deepseek_v4_flash --fork-context --task "..."
+```bash
+"${CODEX_HOME:-$HOME/.codex}/bin/spawn-deepseek-subagent.sh" --agent-type deepseek_v4_flash --fork-context --task "..."
 ```
 
 ## Verify
 
 After install or repair, verify the backend:
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:4466/health
+```bash
+curl -fsS http://127.0.0.1:4466/health
 ```
 
 Restart or reload Codex after installation so the registered MCP server is discovered.

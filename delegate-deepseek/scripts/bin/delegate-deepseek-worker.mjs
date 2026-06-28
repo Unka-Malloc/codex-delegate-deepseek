@@ -9,6 +9,12 @@ const HOME = os.homedir();
 const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, ".codex");
 const SERVICE_PORT = process.env.CODEX_DEEPSEEK_SERVICE_PORT || "4466";
 const DEFAULT_SERVICE_MODELS_URL = process.env.CODEX_DEEPSEEK_SERVICE_MODELS_URL || `http://127.0.0.1:${SERVICE_PORT}/v1/models`;
+const IS_WINDOWS = process.platform === "win32";
+const DEFAULT_START_SCRIPT = path.join(
+  CODEX_HOME,
+  "bin",
+  IS_WINDOWS ? "start-deepseek-subagent-mcp-backend.ps1" : "start-deepseek-subagent-mcp-backend.sh",
+);
 const AGENT_TYPES = {
   deepseek_v4_flash: {
     model: "deepseek-v4-flash",
@@ -427,6 +433,29 @@ function parseCodexPathFromConfig() {
   return match ? match[1] : null;
 }
 
+function isExecutable(file) {
+  try {
+    fs.accessSync(file, IS_WINDOWS ? fs.constants.F_OK : fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findOnPath(command) {
+  const pathValue = process.env.PATH || "";
+  const extensions = IS_WINDOWS
+    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT;.COM").split(";")
+    : [""];
+  for (const dir of pathValue.split(path.delimiter).filter(Boolean)) {
+    for (const ext of extensions) {
+      const full = path.join(dir, `${command}${ext}`);
+      if (isExecutable(full)) return full;
+    }
+  }
+  return null;
+}
+
 function findCodexExecutable() {
   if (process.env.CODEX_CLI_PATH && fs.existsSync(process.env.CODEX_CLI_PATH)) {
     return process.env.CODEX_CLI_PATH;
@@ -434,12 +463,21 @@ function findCodexExecutable() {
   const fromConfig = parseCodexPathFromConfig();
   if (fromConfig && fs.existsSync(fromConfig)) return fromConfig;
 
-  const localAppData = process.env.LOCALAPPDATA || path.join(HOME, "AppData", "Local");
-  const binRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
-  const matches = walkFiles(binRoot, file => path.basename(file).toLowerCase() === "codex.exe");
-  if (matches.length > 0) {
-    matches.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-    return matches[0];
+  const fromPath = findOnPath("codex");
+  if (fromPath) return fromPath;
+
+  if (IS_WINDOWS) {
+    const localAppData = process.env.LOCALAPPDATA || path.join(HOME, "AppData", "Local");
+    const binRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+    const matches = walkFiles(binRoot, file => path.basename(file).toLowerCase() === "codex.exe");
+    if (matches.length > 0) {
+      matches.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+      return matches[0];
+    }
+  } else {
+    for (const candidate of ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "/usr/bin/codex"]) {
+      if (isExecutable(candidate)) return candidate;
+    }
   }
   return "codex";
 }
@@ -462,7 +500,7 @@ async function ensureService(opts) {
 
   const script = process.env.CODEX_DEEPSEEK_SERVICE_START_SCRIPT
     ? path.resolve(process.env.CODEX_DEEPSEEK_SERVICE_START_SCRIPT)
-    : path.join(CODEX_HOME, "bin", "start-deepseek-subagent-mcp-backend.ps1");
+    : DEFAULT_START_SCRIPT;
   if (!fs.existsSync(script)) {
     throw new Error(`DeepSeek service start script not found: ${script}`);
   }
@@ -472,9 +510,10 @@ async function ensureService(opts) {
   const err = path.join(state, "backend.err.log");
   const outFd = fs.openSync(out, "a");
   const errFd = fs.openSync(err, "a");
-  const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], {
+  const startCommand = serviceStartCommand(script);
+  const child = spawn(startCommand.command, startCommand.args, {
     detached: true,
-    windowsHide: true,
+    windowsHide: IS_WINDOWS,
     stdio: ["ignore", outFd, errFd],
   });
   child.unref();
@@ -484,6 +523,19 @@ async function ensureService(opts) {
     if (await serviceResponds()) return;
   }
   throw new Error(`Started codex-deepseek-service but it did not answer. Logs: ${out}, ${err}`);
+}
+
+function serviceStartCommand(script) {
+  if (IS_WINDOWS || script.toLowerCase().endsWith(".ps1")) {
+    return {
+      command: "powershell.exe",
+      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
+    };
+  }
+  if (script.endsWith(".sh") && !isExecutable(script)) {
+    return { command: "/bin/bash", args: [script] };
+  }
+  return { command: script, args: [] };
 }
 
 function codexArgs(opts, cwd, finalPath, agent) {
@@ -534,7 +586,7 @@ function runWorker(prompt, opts, cwd, agent) {
     const child = spawn(codex, args, {
       cwd,
       detached: true,
-      windowsHide: true,
+      windowsHide: IS_WINDOWS,
       stdio: ["pipe", outFd, errFd],
     });
     child.stdin.end(prompt);
@@ -549,7 +601,7 @@ function runWorker(prompt, opts, cwd, agent) {
     stdio: ["pipe", "pipe", "pipe"],
     encoding: "utf8",
     maxBuffer: 1024 * 1024 * 64,
-    windowsHide: true,
+    windowsHide: IS_WINDOWS,
   });
 
   fs.writeFileSync(paths.out, child.stdout || "", "utf8");
