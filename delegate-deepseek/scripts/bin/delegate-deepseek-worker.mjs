@@ -582,7 +582,7 @@ function writeJobMeta(paths, meta) {
   fs.writeFileSync(paths.meta, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
 }
 
-function runWorker(prompt, opts, cwd, agent) {
+async function runWorker(prompt, opts, cwd, agent) {
   const codex = findCodexExecutable();
   const paths = runPaths(agent);
   const args = codexArgs(opts, cwd, paths.final, agent);
@@ -607,11 +607,12 @@ function runWorker(prompt, opts, cwd, agent) {
   };
 
   if (opts.background) {
+    const superviseBackground = process.env.CODEX_DEEPSEEK_SUPERVISE_BACKGROUND === "1";
     const outFd = fs.openSync(paths.out, "a");
     const errFd = fs.openSync(paths.err, "a");
     const child = spawn(codex, args, {
       cwd,
-      detached: !IS_WINDOWS,
+      detached: superviseBackground ? false : !IS_WINDOWS,
       windowsHide: IS_WINDOWS,
       stdio: ["pipe", outFd, errFd],
     });
@@ -622,8 +623,26 @@ function runWorker(prompt, opts, cwd, agent) {
       pid: child.pid,
       background: true,
     });
-    child.unref();
     process.stdout.write(`Started ${agent.label} fork worker pid=${child.pid}\njob_id=${paths.jobId}\nstdout=${paths.out}\nstderr=${paths.err}\nfinal=${paths.final}\nmeta=${paths.meta}\n`);
+    if (superviseBackground) {
+      return await new Promise(resolve => {
+        child.on("close", (code, signal) => {
+          try { fs.closeSync(outFd); } catch {}
+          try { fs.closeSync(errFd); } catch {}
+          writeJobMeta(paths, {
+            ...baseJob,
+            status: (code ?? 1) === 0 ? "completed" : "failed",
+            pid: child.pid,
+            background: true,
+            code,
+            signal,
+            finished_at: new Date().toISOString(),
+          });
+          resolve(code ?? 1);
+        });
+      });
+    }
+    child.unref();
     return 0;
   }
 
@@ -693,7 +712,7 @@ async function main() {
   }
 
   await ensureService(opts);
-  const status = runWorker(prompt, opts, cwd, agent);
+  const status = await runWorker(prompt, opts, cwd, agent);
   process.exit(status);
 }
 

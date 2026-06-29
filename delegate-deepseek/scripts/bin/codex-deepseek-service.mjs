@@ -1226,7 +1226,8 @@ function spawnForkScheduler(body, opts) {
   if (body.max_chars || body.maxChars) args.push("--max-chars", String(body.max_chars || body.maxChars));
   if (body.tail_events || body.tailEvents) args.push("--tail-events", String(body.tail_events || body.tailEvents));
   if (body.ephemeral !== false) args.push("--ephemeral");
-  if (body.background !== false) args.push("--background");
+  const background = body.background !== false;
+  if (background) args.push("--background");
   const child = spawn(process.execPath, args, {
     cwd: body.cwd || process.cwd(),
     windowsHide: true,
@@ -1234,15 +1235,15 @@ function spawnForkScheduler(body, opts) {
       ...process.env,
       CODEX_DEEPSEEK_SERVICE_PORT: String(opts.port),
       CODEX_DEEPSEEK_SERVICE_URL: `http://${opts.host}:${opts.port}/v1`,
+      ...(background ? { CODEX_DEEPSEEK_SUPERVISE_BACKGROUND: "1" } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
   return new Promise(resolve => {
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", chunk => { stdout += chunk.toString(); });
-    child.stderr.on("data", chunk => { stderr += chunk.toString(); });
-    child.on("close", code => {
+    let settled = false;
+    const buildResult = code => {
       const result = { code, stdout, stderr, pid: child.pid };
       const launch = parseWorkerLaunch(stdout);
       if (launch) {
@@ -1255,7 +1256,36 @@ function spawnForkScheduler(body, opts) {
           } catch {}
         }
       }
-      resolve(result);
+      return result;
+    };
+    const maybeResolveLaunched = () => {
+      if (settled || !background) return;
+      const launch = parseWorkerLaunch(stdout);
+      if (!launch?.job_id) return;
+      settled = true;
+      resolve(buildResult(0));
+    };
+    const launchTimer = background ? setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        code: 1,
+        stdout,
+        stderr,
+        pid: child.pid,
+        error: "Timed out waiting for DeepSeek worker job_id",
+      });
+    }, asInt(body.timeout_ms ?? body.timeoutMs, 30000, 10000, 120000)) : null;
+    child.stdout.on("data", chunk => {
+      stdout += chunk.toString();
+      maybeResolveLaunched();
+    });
+    child.stderr.on("data", chunk => { stderr += chunk.toString(); });
+    child.on("close", code => {
+      if (launchTimer) clearTimeout(launchTimer);
+      if (settled) return;
+      settled = true;
+      resolve(buildResult(code));
     });
   });
 }
