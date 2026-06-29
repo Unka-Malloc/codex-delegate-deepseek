@@ -5,7 +5,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const HOME = os.homedir();
 const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, ".codex");
@@ -25,6 +25,9 @@ Options:
   --upstream <url>        DeepSeek Chat Completions base URL. Default: https://api.deepseek.com/v1.
   --models <csv>          Local model catalog. Default: deepseek-v4-flash,deepseek-v4-pro.
   --session-dir <path>    Disk session directory. Default: CODEX_HOME/state/delegate-deepseek/sessions.
+  --worker-state-dir <path>
+                          Worker job state directory. Default: CODEX_HOME/state/delegate-deepseek/workers.
+  --fork-script <path>    Worker scheduler script. Default: CODEX_HOME/bin/delegate-deepseek-worker.mjs.
   --log <path>            JSONL service log. Default: CODEX_HOME/state/delegate-deepseek/backend.jsonl.
   --no-upstream-models    Do not merge upstream /models into the local model catalog.
   --help                  Show this help.
@@ -55,6 +58,8 @@ function parseArgs(argv) {
       .map(s => s.trim())
       .filter(Boolean),
     sessionDir: process.env.CODEX_DEEPSEEK_SERVICE_SESSION_DIR || path.join(CODEX_HOME, "state", "delegate-deepseek", "sessions"),
+    workerStateDir: process.env.CODEX_DEEPSEEK_WORKER_STATE_DIR || path.join(CODEX_HOME, "state", "delegate-deepseek", "workers"),
+    forkScript: process.env.CODEX_DEEPSEEK_FORK_SCRIPT || path.join(CODEX_HOME, "bin", "delegate-deepseek-worker.mjs"),
     logPath: process.env.CODEX_DEEPSEEK_SERVICE_LOG || path.join(CODEX_HOME, "state", "delegate-deepseek", "backend.jsonl"),
     upstreamModels: true,
   };
@@ -80,6 +85,12 @@ function parseArgs(argv) {
         break;
       case "--session-dir":
         opts.sessionDir = path.resolve(next());
+        break;
+      case "--worker-state-dir":
+        opts.workerStateDir = path.resolve(next());
+        break;
+      case "--fork-script":
+        opts.forkScript = path.resolve(next());
         break;
       case "--log":
         opts.logPath = path.resolve(next());
@@ -116,6 +127,13 @@ function id(prefix) {
 
 function sanitizeFileName(value) {
   return String(value || "").replace(/[^A-Za-z0-9_.-]/gu, "_").slice(0, 160);
+}
+
+function asInt(value, fallback, min = 0, max = Number.MAX_SAFE_INTEGER) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(n)));
 }
 
 function redact(text) {
@@ -604,6 +622,295 @@ async function fetchModels(opts, apiKey, log) {
   return [...local.values()];
 }
 
+function cleanJobId(value) {
+  const jobId = String(value || "").trim();
+  if (!jobId) throw new Error("job_id is required");
+  if (!/^[A-Za-z0-9_.-]+$/u.test(jobId)) {
+    throw new Error("job_id may only contain letters, numbers, dots, dashes, and underscores");
+  }
+  return jobId;
+}
+
+function jobMetaPath(opts, jobId) {
+  return path.join(opts.workerStateDir, `${cleanJobId(jobId)}.job.json`);
+}
+
+function safeReadJsonFile(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readJobMeta(opts, jobId) {
+  const metaPath = jobMetaPath(opts, jobId);
+  const meta = safeReadJsonFile(metaPath);
+  if (!meta) {
+    const error = new Error(`DeepSeek worker job not found: ${jobId}`);
+    error.status = 404;
+    throw error;
+  }
+  return {
+    ...meta,
+    job_id: meta.job_id || cleanJobId(jobId),
+    paths: {
+      ...(meta.paths || {}),
+      meta: meta.paths?.meta || metaPath,
+    },
+  };
+}
+
+function writeJobMeta(meta) {
+  fs.writeFileSync(meta.paths.meta, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+}
+
+function fileInfo(file) {
+  if (!file) return { path: null, exists: false, size: 0, mtime: null };
+  try {
+    const stat = fs.statSync(file);
+    return {
+      path: file,
+      exists: true,
+      size: stat.size,
+      mtime: stat.mtime.toISOString(),
+    };
+  } catch {
+    return { path: file, exists: false, size: 0, mtime: null };
+  }
+}
+
+function readProcessCommandLine(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return "";
+  if (process.platform === "win32") {
+    const script = `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${n}" -ErrorAction SilentlyContinue; if ($p) { $p.CommandLine }`;
+    const child = spawnSync("powershell.exe", ["-NoProfile", "-WindowStyle", "Hidden", "-Command", script], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 3000,
+    });
+    return (child.stdout || "").trim();
+  }
+  try {
+    return fs.readFileSync(`/proc/${n}/cmdline`, "utf8").replace(/\0/gu, " ").trim();
+  } catch {
+    return "";
+  }
+}
+
+function pidMatchesJob(pid, meta) {
+  const commandLine = readProcessCommandLine(pid);
+  if (!commandLine) return false;
+  const needles = [
+    meta.paths?.final,
+    meta.paths?.stdout,
+    meta.paths?.stderr,
+    meta.job_id,
+    "delegate-deepseek-worker.mjs",
+    meta.model,
+  ].filter(Boolean).map(String);
+  return needles.some(needle => commandLine.includes(needle));
+}
+
+function isPidRunning(pid, meta = null) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+  } catch (error) {
+    if (error?.code !== "EPERM") return false;
+  }
+  return meta ? pidMatchesJob(n, meta) : true;
+}
+
+function readFileWindow(file, cursor, maxBytes) {
+  const info = fileInfo(file);
+  if (!info.exists || info.size <= 0) {
+    return {
+      path: file || null,
+      text: "",
+      cursor: 0,
+      next_cursor: 0,
+      size: info.size,
+      truncated_head: false,
+      skipped_before_cursor: false,
+    };
+  }
+
+  const explicitCursor = cursor !== undefined && cursor !== null && cursor !== "";
+  const start = explicitCursor
+    ? asInt(cursor, 0, 0, info.size)
+    : Math.max(0, info.size - maxBytes);
+  const length = Math.min(maxBytes, info.size - start);
+  const buffer = Buffer.alloc(length);
+  const fd = fs.openSync(file, "r");
+  let bytesRead = 0;
+  try {
+    bytesRead = fs.readSync(fd, buffer, 0, length, start);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return {
+    path: file,
+    text: buffer.subarray(0, bytesRead).toString("utf8"),
+    cursor: start,
+    next_cursor: start + bytesRead,
+    size: info.size,
+    truncated_head: !explicitCursor && start > 0,
+    skipped_before_cursor: explicitCursor && start > 0,
+  };
+}
+
+function parseWorkerLaunch(stdout) {
+  const launch = { paths: {} };
+  for (const rawLine of String(stdout || "").split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    const match = /^(job_id|pid|stdout|stderr|final|meta)=(.*)$/u.exec(line);
+    if (!match) continue;
+    const [, key, value] = match;
+    if (key === "pid") {
+      launch.pid = Number(value);
+    } else if (key === "job_id") {
+      launch.job_id = value;
+    } else {
+      launch.paths[key] = value;
+    }
+  }
+  return launch.job_id || Object.keys(launch.paths).length > 0 || launch.pid ? launch : null;
+}
+
+function jobSnapshot(opts, jobId, options = {}) {
+  const meta = readJobMeta(opts, jobId);
+  const stdout = fileInfo(meta.paths?.stdout);
+  const stderr = fileInfo(meta.paths?.stderr);
+  const final = fileInfo(meta.paths?.final);
+  const pidCandidates = [meta.child_pid, meta.launcher_pid, meta.pid]
+    .map(pid => Number(pid))
+    .filter(pid => Number.isInteger(pid) && pid > 0);
+  const runningPids = pidCandidates.filter(pid => isPidRunning(pid, meta));
+  let status = meta.status || "unknown";
+
+  if (final.exists && final.size > 0) {
+    status = "completed";
+  } else if (runningPids.length > 0) {
+    status = "running";
+  } else if (status === "running") {
+    status = "exited";
+  }
+
+  const snapshot = {
+    ...meta,
+    status,
+    pid_running: runningPids.length > 0,
+    running_pids: runningPids,
+    files: { stdout, stderr, final, meta: fileInfo(meta.paths?.meta) },
+  };
+
+  if (options.includeFinal && final.exists && final.size > 0) {
+    snapshot.final_text = readFileWindow(meta.paths.final, undefined, options.maxBytes || 20000).text.trim();
+  }
+  return snapshot;
+}
+
+function jobTail(opts, args) {
+  const jobId = cleanJobId(args.job_id || args.jobId);
+  const maxBytes = asInt(args.max_bytes ?? args.maxBytes, 20000, 1024, 1024 * 1024);
+  const snapshot = jobSnapshot(opts, jobId, { includeFinal: true, maxBytes });
+  return {
+    job_id: jobId,
+    status: snapshot.status,
+    pid: snapshot.pid || null,
+    pid_running: snapshot.pid_running,
+    running_pids: snapshot.running_pids,
+    stdout: readFileWindow(snapshot.paths?.stdout, args.stdout_cursor ?? args.stdoutCursor, maxBytes),
+    stderr: readFileWindow(snapshot.paths?.stderr, args.stderr_cursor ?? args.stderrCursor, maxBytes),
+    final_text: snapshot.final_text || "",
+    files: snapshot.files,
+  };
+}
+
+function listJobs(opts, args = {}) {
+  const limit = asInt(args.limit, 20, 1, 200);
+  if (!fs.existsSync(opts.workerStateDir)) return { jobs: [] };
+  const files = fs.readdirSync(opts.workerStateDir)
+    .filter(name => name.endsWith(".job.json"))
+    .map(name => path.join(opts.workerStateDir, name))
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
+    .slice(0, limit);
+  const jobs = files
+    .map(file => safeReadJsonFile(file))
+    .filter(Boolean)
+    .map(meta => jobSnapshot(opts, meta.job_id, { includeFinal: false }));
+  return { jobs };
+}
+
+async function waitJob(opts, args) {
+  const jobId = cleanJobId(args.job_id || args.jobId);
+  const timeoutMs = asInt(args.timeout_ms ?? args.timeoutMs, 30000, 1000, 300000);
+  const intervalMs = asInt(args.interval_ms ?? args.intervalMs, 500, 100, 10000);
+  const stdoutCursor = asInt(args.stdout_cursor ?? args.stdoutCursor, 0, 0);
+  const stderrCursor = asInt(args.stderr_cursor ?? args.stderrCursor, 0, 0);
+  const deadline = Date.now() + timeoutMs;
+  let snapshot = jobSnapshot(opts, jobId, { includeFinal: true });
+  let timedOut = false;
+
+  for (;;) {
+    const stdoutSize = snapshot.files?.stdout?.size || 0;
+    const stderrSize = snapshot.files?.stderr?.size || 0;
+    const hasNewOutput = stdoutSize > stdoutCursor || stderrSize > stderrCursor;
+    const done = !snapshot.pid_running && !["running", "unknown"].includes(snapshot.status);
+    if (hasNewOutput || done) break;
+    if (Date.now() >= deadline) {
+      timedOut = true;
+      break;
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, Math.max(0, deadline - Date.now()))));
+    snapshot = jobSnapshot(opts, jobId, { includeFinal: true });
+  }
+
+  return {
+    timed_out: timedOut,
+    ...jobTail(opts, args),
+  };
+}
+
+function cancelJob(opts, args) {
+  const jobId = cleanJobId(args.job_id || args.jobId);
+  const meta = readJobMeta(opts, jobId);
+  const snapshot = jobSnapshot(opts, jobId, { includeFinal: false });
+  const pids = [snapshot.child_pid, snapshot.launcher_pid, snapshot.pid]
+    .map(pid => Number(pid))
+    .filter(pid => Number.isInteger(pid) && pid > 0);
+  const errors = [];
+  const killed = [];
+  for (const pid of [...new Set(pids)]) {
+    if (!isPidRunning(pid, meta)) continue;
+    try {
+      process.kill(pid);
+      killed.push(pid);
+    } catch (error) {
+      errors.push({ pid, message: error.message });
+    }
+  }
+
+  if (killed.length > 0) {
+    writeJobMeta({
+      ...meta,
+      status: "canceled",
+      canceled_at: new Date().toISOString(),
+    });
+  }
+
+  return {
+    job_id: jobId,
+    killed: killed.length > 0,
+    killed_pids: killed,
+    errors,
+    status: killed.length > 0 ? "canceled" : snapshot.status,
+  };
+}
+
 async function upstreamChat(opts, apiKey, chatReq) {
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
@@ -897,7 +1204,7 @@ async function handleStreaming({ res, opts, apiKey, sessions, log, reqBody, resp
 }
 
 function spawnForkScheduler(body, opts) {
-  const script = path.join(CODEX_HOME, "bin", "delegate-deepseek-worker.mjs");
+  const script = opts.forkScript;
   if (!fs.existsSync(script)) throw new Error(`Missing fork tool: ${script}`);
   const args = [script];
   const task = body.task || body.message;
@@ -935,7 +1242,21 @@ function spawnForkScheduler(body, opts) {
     let stderr = "";
     child.stdout.on("data", chunk => { stdout += chunk.toString(); });
     child.stderr.on("data", chunk => { stderr += chunk.toString(); });
-    child.on("close", code => resolve({ code, stdout, stderr, pid: child.pid }));
+    child.on("close", code => {
+      const result = { code, stdout, stderr, pid: child.pid };
+      const launch = parseWorkerLaunch(stdout);
+      if (launch) {
+        result.job_id = launch.job_id || null;
+        result.worker_pid = launch.pid || null;
+        result.paths = launch.paths;
+        if (launch.job_id) {
+          try {
+            result.job = jobSnapshot(opts, launch.job_id, { includeFinal: false });
+          } catch {}
+        }
+      }
+      resolve(result);
+    });
   });
 }
 
@@ -1000,6 +1321,49 @@ async function main() {
         return;
       }
 
+      if (req.method === "GET" && url.pathname === "/v1/codex/jobs") {
+        writeJson(res, 200, listJobs(opts, { limit: url.searchParams.get("limit") }));
+        return;
+      }
+
+      if (url.pathname.startsWith("/v1/codex/jobs/")) {
+        const parts = url.pathname.split("/").filter(Boolean);
+        const jobId = decodeURIComponent(parts[3] || "");
+        const action = parts[4] || "status";
+
+        if (req.method === "GET" && action === "status") {
+          writeJson(res, 200, jobSnapshot(opts, jobId, {
+            includeFinal: url.searchParams.get("include_final") !== "false",
+            maxBytes: asInt(url.searchParams.get("max_bytes"), 20000, 1024, 1024 * 1024),
+          }));
+          return;
+        }
+
+        if (req.method === "POST" && action === "tail") {
+          writeJson(res, 200, jobTail(opts, {
+            job_id: jobId,
+            ...await readJson(req),
+          }));
+          return;
+        }
+
+        if (req.method === "POST" && action === "wait") {
+          writeJson(res, 200, await waitJob(opts, {
+            job_id: jobId,
+            ...await readJson(req),
+          }));
+          return;
+        }
+
+        if (req.method === "POST" && action === "cancel") {
+          writeJson(res, 200, cancelJob(opts, {
+            job_id: jobId,
+            ...await readJson(req),
+          }));
+          return;
+        }
+      }
+
       if (req.method === "POST" && ["/v1/codex/fork", "/v1/codex/subagent"].includes(url.pathname)) {
         const body = await readJson(req);
         const agentType = body.agent_type || body.agentType || "deepseek_v4_flash";
@@ -1025,6 +1389,10 @@ async function main() {
           fork_context: forkContext,
           code: result.code,
           pid: result.pid,
+          worker_pid: result.worker_pid,
+          job_id: result.job_id,
+          paths: result.paths,
+          job: result.job,
           stdout: result.stdout,
           stderr: result.stderr,
         });

@@ -48,3 +48,24 @@ containing only DeepSeek models unless you intentionally want to hide Codex's
 built-in models.
 
 Restart or reload Codex after installation.
+
+## Monitoring DeepSeek workers
+
+Use `spawn_deepseek_subagent` with `background=true` for long-running work. The
+MCP server forwards the request to the local `codex-deepseek-service`; the MCP
+process does not directly own the worker process.
+
+The spawn result includes `job_id`, artifact paths, and the monitoring tools to
+use next:
+
+- `deepseek_subagent_wait`: long-poll until new output is available or the job
+  finishes.
+- `deepseek_subagent_tail`: read stdout/stderr deltas using byte cursors.
+- `deepseek_subagent_job_status`: inspect status, process liveness, and final
+  reply text when available.
+- `deepseek_subagent_cancel`: conservatively cancel a running worker only when
+  the service can verify the process still belongs to that job.
+
+The service also exposes the same state over HTTP under `/v1/codex/jobs`. Worker
+metadata is persisted in `$CODEX_HOME/state/delegate-deepseek/workers/*.job.json`
+so monitoring can survive MCP process restarts.

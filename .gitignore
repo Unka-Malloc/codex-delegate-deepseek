@@ -1,6 +1,12 @@
 state/
 tmp/
+.codex/
+.env
+.env.*
+!.env.example
 *.log
 *.jsonl
+*.job.json
 *.final.txt
+*.prompt.txt
 node_modules/

@@ -563,10 +563,13 @@ function runPaths(agent) {
   const state = path.join(CODEX_HOME, "state", "delegate-deepseek", "workers");
   fs.mkdirSync(state, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/gu, "-");
+  const jobId = `${agent.logPrefix}-fork-${stamp}`;
   return {
-    out: path.join(state, `${agent.logPrefix}-fork-${stamp}.out.log`),
-    err: path.join(state, `${agent.logPrefix}-fork-${stamp}.err.log`),
-    final: path.join(state, `${agent.logPrefix}-fork-${stamp}.final.txt`),
+    jobId,
+    out: path.join(state, `${jobId}.out.log`),
+    err: path.join(state, `${jobId}.err.log`),
+    final: path.join(state, `${jobId}.final.txt`),
+    meta: path.join(state, `${jobId}.job.json`),
   };
 }
 
@@ -575,23 +578,52 @@ function tail(text, limit = 4000) {
   return s.length <= limit ? s : s.slice(-limit);
 }
 
+function writeJobMeta(paths, meta) {
+  fs.writeFileSync(paths.meta, `${JSON.stringify(meta, null, 2)}\n`, "utf8");
+}
+
 function runWorker(prompt, opts, cwd, agent) {
   const codex = findCodexExecutable();
   const paths = runPaths(agent);
   const args = codexArgs(opts, cwd, paths.final, agent);
+  const startedAt = new Date().toISOString();
+  const baseJob = {
+    schema: "delegate-deepseek.worker-job.v1",
+    job_id: paths.jobId,
+    agent_type: agent.agentType,
+    agent_label: agent.label,
+    model: agent.model,
+    model_provider: opts.modelProvider,
+    cwd,
+    command: codex,
+    args,
+    paths: {
+      stdout: paths.out,
+      stderr: paths.err,
+      final: paths.final,
+      meta: paths.meta,
+    },
+    started_at: startedAt,
+  };
 
   if (opts.background) {
     const outFd = fs.openSync(paths.out, "a");
     const errFd = fs.openSync(paths.err, "a");
     const child = spawn(codex, args, {
       cwd,
-      detached: true,
+      detached: !IS_WINDOWS,
       windowsHide: IS_WINDOWS,
       stdio: ["pipe", outFd, errFd],
     });
     child.stdin.end(prompt);
+    writeJobMeta(paths, {
+      ...baseJob,
+      status: "running",
+      pid: child.pid,
+      background: true,
+    });
     child.unref();
-    process.stdout.write(`Started ${agent.label} fork worker pid=${child.pid}\nstdout=${paths.out}\nstderr=${paths.err}\nfinal=${paths.final}\n`);
+    process.stdout.write(`Started ${agent.label} fork worker pid=${child.pid}\njob_id=${paths.jobId}\nstdout=${paths.out}\nstderr=${paths.err}\nfinal=${paths.final}\nmeta=${paths.meta}\n`);
     return 0;
   }
 
@@ -606,6 +638,16 @@ function runWorker(prompt, opts, cwd, agent) {
 
   fs.writeFileSync(paths.out, child.stdout || "", "utf8");
   fs.writeFileSync(paths.err, child.stderr || "", "utf8");
+  writeJobMeta(paths, {
+    ...baseJob,
+    status: (child.status ?? 1) === 0 && !child.error ? "completed" : "failed",
+    pid: null,
+    background: false,
+    code: child.status,
+    signal: child.signal,
+    error: child.error ? child.error.message : null,
+    finished_at: new Date().toISOString(),
+  });
   const finalText = fs.existsSync(paths.final) ? fs.readFileSync(paths.final, "utf8").trim() : "";
   if (finalText) {
     process.stdout.write(`${finalText}\n`);
@@ -620,7 +662,7 @@ function runWorker(prompt, opts, cwd, agent) {
     if (stderrTail) process.stdout.write(`\n--- nested stderr tail ---\n${stderrTail}\n`);
   }
 
-  process.stdout.write(`\n${agent.label} fork artifacts:\nstdout=${paths.out}\nstderr=${paths.err}\nfinal=${paths.final}\n`);
+  process.stdout.write(`\n${agent.label} fork artifacts:\njob_id=${paths.jobId}\nstdout=${paths.out}\nstderr=${paths.err}\nfinal=${paths.final}\nmeta=${paths.meta}\n`);
   if ((child.status ?? 1) !== 0) {
     const stderrTail = tail(child.stderr, 4000).trim();
     if (stderrTail) process.stderr.write(`\nDeepSeek fork worker stderr tail:\n${stderrTail}\n`);

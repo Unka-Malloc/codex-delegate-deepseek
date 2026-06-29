@@ -1,21 +1,7 @@
 #!/usr/bin/env node
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { spawnSync } from "node:child_process";
-
-const HOME = os.homedir();
-const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, ".codex");
 const SERVICE_PORT = process.env.CODEX_DEEPSEEK_SERVICE_PORT || "4466";
 const SERVICE_BASE_URL = process.env.CODEX_DEEPSEEK_SERVICE_URL || `http://127.0.0.1:${SERVICE_PORT}/v1`;
-const FORK_SCRIPT = process.env.CODEX_DEEPSEEK_FORK_SCRIPT || path.join(CODEX_HOME, "bin", "delegate-deepseek-worker.mjs");
-const MODEL_PROVIDER = process.env.CODEX_DEEPSEEK_MODEL_PROVIDER || "deepseek";
-const BACKEND_START_SCRIPT = process.env.CODEX_DEEPSEEK_SERVICE_START_SCRIPT || path.join(
-  CODEX_HOME,
-  "bin",
-  process.platform === "win32" ? "start-deepseek-subagent-mcp-backend.ps1" : "start-deepseek-subagent-mcp-backend.sh",
-);
 
 const SERVER_INFO = {
   name: "local-deepseek-subagent",
@@ -105,6 +91,27 @@ async function handleDeepseekServiceStatus() {
   }, null, 2));
 }
 
+async function serviceJson(pathname, { method = "GET", body = undefined } = {}) {
+  const response = await fetch(statusUrl(pathname), {
+    method,
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(310000),
+  });
+  const text = await response.text();
+  const data = safeParseJson(text);
+  if (!response.ok) {
+    const message = typeof data === "object" && data?.error?.message
+      ? data.error.message
+      : text || `HTTP ${response.status}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.body = data;
+    throw error;
+  }
+  return data;
+}
+
 function safeParseJson(text) {
   try {
     return JSON.parse(text);
@@ -125,11 +132,61 @@ function validateAgentType(agentType) {
   return normalized;
 }
 
-function spawnDeepseekSubagent(args) {
-  if (!fs.existsSync(FORK_SCRIPT)) {
-    throw new Error(`Fork scheduler script not found: ${FORK_SCRIPT}`);
+function cleanJobId(value) {
+  const jobId = cleanString(value);
+  if (!jobId) throw new Error("job_id is required");
+  if (!/^[A-Za-z0-9_.-]+$/u.test(jobId)) {
+    throw new Error("job_id may only contain letters, numbers, dots, dashes, and underscores");
   }
+  return jobId;
+}
 
+function handleJobStatus(args) {
+  const jobId = cleanJobId(args.job_id || args.jobId);
+  const maxBytes = asInt(args.max_bytes ?? args.maxBytes, 20000, 1024, 1024 * 1024);
+  const includeFinal = asBool(args.include_final ?? args.includeFinal, true);
+  const search = new URLSearchParams({
+    include_final: includeFinal ? "true" : "false",
+    max_bytes: String(maxBytes),
+  });
+  return serviceJson(`/codex/jobs/${encodeURIComponent(jobId)}?${search}`).then(data => (
+    toolText(JSON.stringify(data, null, 2))
+  ));
+}
+
+function handleJobTail(args) {
+  const jobId = cleanJobId(args.job_id || args.jobId);
+  return serviceJson(`/codex/jobs/${encodeURIComponent(jobId)}/tail`, {
+    method: "POST",
+    body: args,
+  }).then(data => toolText(JSON.stringify(data, null, 2)));
+}
+
+async function handleJobWait(args) {
+  const jobId = cleanJobId(args.job_id || args.jobId);
+  const data = await serviceJson(`/codex/jobs/${encodeURIComponent(jobId)}/wait`, {
+    method: "POST",
+    body: args,
+  });
+  return toolText(JSON.stringify(data, null, 2));
+}
+
+function handleJobList(args) {
+  const search = new URLSearchParams({
+    limit: String(asInt(args.limit, 20, 1, 200)),
+  });
+  return serviceJson(`/codex/jobs?${search}`).then(data => toolText(JSON.stringify(data, null, 2)));
+}
+
+function handleJobCancel(args) {
+  const jobId = cleanJobId(args.job_id || args.jobId);
+  return serviceJson(`/codex/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+    body: args,
+  }).then(data => toolText(JSON.stringify(data, null, 2), Array.isArray(data.errors) && data.errors.length > 0));
+}
+
+async function spawnDeepseekSubagent(args) {
   const task = cleanString(args.task || args.message);
   if (!task) {
     throw new Error("task is required");
@@ -143,55 +200,25 @@ function spawnDeepseekSubagent(args) {
   }
 
   const background = asBool(args.background, false);
-  const ephemeral = asBool(args.ephemeral, true);
-  const timeoutMs = asInt(args.timeout_ms ?? args.timeoutMs, background ? 30_000 : 300_000, 10_000, 3_600_000);
-
-  const argv = [
-    FORK_SCRIPT,
-    "--model-provider", MODEL_PROVIDER,
-    "--agent-type", agentType,
-    "--context-mode", contextMode,
-    "--task", task,
-  ];
-
-  if (args.model) argv.push("--model", String(args.model));
-  if (args.thread_id || args.threadId) argv.push("--thread-id", String(args.thread_id || args.threadId));
-  if (args.transcript) argv.push("--transcript", String(args.transcript));
-  if (args.cwd) argv.push("--cwd", String(args.cwd));
-  if (args.max_chars || args.maxChars) argv.push("--max-chars", String(asInt(args.max_chars ?? args.maxChars, 60000, 10000)));
-  if (args.tail_events || args.tailEvents) argv.push("--tail-events", String(asInt(args.tail_events ?? args.tailEvents, 80, 10)));
-  if (ephemeral) argv.push("--ephemeral");
-  if (background) argv.push("--background");
-
-  const child = spawnSync(process.execPath, argv, {
-    cwd: cleanString(args.cwd) || process.cwd(),
-    env: {
-      ...process.env,
-      CODEX_DEEPSEEK_SERVICE_PORT: String(SERVICE_PORT),
-      CODEX_DEEPSEEK_SERVICE_URL: SERVICE_BASE_URL,
-      CODEX_DEEPSEEK_SERVICE_MODELS_URL: `${SERVICE_BASE_URL.replace(/\/+$/u, "")}/models`,
-      CODEX_DEEPSEEK_SERVICE_START_SCRIPT: BACKEND_START_SCRIPT,
-      CODEX_DEEPSEEK_MODEL_PROVIDER: MODEL_PROVIDER,
+  const result = await serviceJson("/codex/subagent", {
+    method: "POST",
+    body: {
+      ...args,
+      task,
+      agent_type: agentType,
+      fork_context: forkContext,
+      context_mode: contextMode,
+      background,
     },
-    encoding: "utf8",
-    timeout: timeoutMs,
-    maxBuffer: 1024 * 1024 * 64,
-    windowsHide: true,
   });
-
-  const result = {
-    ok: child.status === 0 && !child.error,
-    code: child.status,
-    signal: child.signal,
-    error: child.error ? child.error.message : null,
-    agent_type: agentType,
-    fork_context: forkContext,
-    context_mode: contextMode,
-    background,
-    stdout: child.stdout || "",
-    stderr: child.stderr || "",
-  };
-
+  if (result.job_id) {
+    result.monitoring = {
+      status_tool: "deepseek_subagent_job_status",
+      tail_tool: "deepseek_subagent_tail",
+      wait_tool: "deepseek_subagent_wait",
+      cancel_tool: "deepseek_subagent_cancel",
+    };
+  }
   return toolText(JSON.stringify(result, null, 2), !result.ok);
 }
 
@@ -283,6 +310,150 @@ const tools = [
       properties: {},
     },
   },
+  {
+    name: "deepseek_subagent_list",
+    title: "List DeepSeek Subagent Jobs",
+    description: "List recent DeepSeek worker jobs and their current file/process status.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 200,
+          default: 20,
+          description: "Maximum number of recent jobs to return.",
+        },
+      },
+    },
+  },
+  {
+    name: "deepseek_subagent_job_status",
+    title: "DeepSeek Subagent Job Status",
+    description: "Check one DeepSeek worker job by job_id, including process liveness and final reply when available.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        job_id: {
+          type: "string",
+          description: "Job id returned by spawn_deepseek_subagent.",
+        },
+        include_final: {
+          type: "boolean",
+          default: true,
+          description: "Include the final reply text when the final artifact exists.",
+        },
+        max_bytes: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 1048576,
+          default: 20000,
+          description: "Maximum bytes to read from the final reply artifact.",
+        },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "deepseek_subagent_tail",
+    title: "Tail DeepSeek Subagent Job",
+    description: "Read stdout/stderr deltas for a DeepSeek worker job using byte cursors.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        job_id: {
+          type: "string",
+          description: "Job id returned by spawn_deepseek_subagent.",
+        },
+        stdout_cursor: {
+          type: "integer",
+          minimum: 0,
+          description: "Byte offset for stdout. Omit to read the latest tail.",
+        },
+        stderr_cursor: {
+          type: "integer",
+          minimum: 0,
+          description: "Byte offset for stderr. Omit to read the latest tail.",
+        },
+        max_bytes: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 1048576,
+          default: 20000,
+          description: "Maximum bytes to read from each stream.",
+        },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "deepseek_subagent_wait",
+    title: "Wait For DeepSeek Subagent Job",
+    description: "Long-poll a DeepSeek worker job until new output is available, the job completes, or timeout expires.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        job_id: {
+          type: "string",
+          description: "Job id returned by spawn_deepseek_subagent.",
+        },
+        stdout_cursor: {
+          type: "integer",
+          minimum: 0,
+          default: 0,
+          description: "Current stdout byte cursor.",
+        },
+        stderr_cursor: {
+          type: "integer",
+          minimum: 0,
+          default: 0,
+          description: "Current stderr byte cursor.",
+        },
+        timeout_ms: {
+          type: "integer",
+          minimum: 1000,
+          maximum: 300000,
+          default: 30000,
+          description: "Maximum wait time in milliseconds.",
+        },
+        interval_ms: {
+          type: "integer",
+          minimum: 100,
+          maximum: 10000,
+          default: 500,
+          description: "Polling interval in milliseconds.",
+        },
+        max_bytes: {
+          type: "integer",
+          minimum: 1024,
+          maximum: 1048576,
+          default: 20000,
+          description: "Maximum bytes to read from each stream after waiting.",
+        },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "deepseek_subagent_cancel",
+    title: "Cancel DeepSeek Subagent Job",
+    description: "Terminate a running DeepSeek worker process by job_id and mark the job canceled.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        job_id: {
+          type: "string",
+          description: "Job id returned by spawn_deepseek_subagent.",
+        },
+      },
+      required: ["job_id"],
+    },
+  },
 ];
 
 async function handleRequest(message) {
@@ -310,10 +481,25 @@ async function handleRequest(message) {
     const toolName = params.name;
     const toolArgs = params.arguments || {};
     if (toolName === "spawn_deepseek_subagent") {
-      return jsonRpcResult(id, spawnDeepseekSubagent(toolArgs));
+      return jsonRpcResult(id, await spawnDeepseekSubagent(toolArgs));
     }
     if (toolName === "deepseek_subagent_status") {
       return jsonRpcResult(id, await handleDeepseekServiceStatus());
+    }
+    if (toolName === "deepseek_subagent_list") {
+      return jsonRpcResult(id, await handleJobList(toolArgs));
+    }
+    if (toolName === "deepseek_subagent_job_status") {
+      return jsonRpcResult(id, await handleJobStatus(toolArgs));
+    }
+    if (toolName === "deepseek_subagent_tail") {
+      return jsonRpcResult(id, await handleJobTail(toolArgs));
+    }
+    if (toolName === "deepseek_subagent_wait") {
+      return jsonRpcResult(id, await handleJobWait(toolArgs));
+    }
+    if (toolName === "deepseek_subagent_cancel") {
+      return jsonRpcResult(id, await handleJobCancel(toolArgs));
     }
     return jsonRpcError(id, -32601, `Unknown tool: ${toolName}`);
   }
@@ -356,4 +542,4 @@ process.stdin.on("data", chunk => {
   }
 });
 
-log(`ready; service=${SERVICE_BASE_URL}; model_provider=${MODEL_PROVIDER}; fork_script=${FORK_SCRIPT}`);
+log(`ready; service=${SERVICE_BASE_URL}`);

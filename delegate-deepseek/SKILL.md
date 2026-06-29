@@ -67,6 +67,18 @@ If the MCP tool is not loaded in the current thread, use the bundled CLI fallbac
 "${CODEX_HOME:-$HOME/.codex}/bin/spawn-deepseek-subagent.sh" --agent-type deepseek_v4_flash --fork-context --task "..."
 ```
 
+For work that should be monitored while it runs, call `spawn_deepseek_subagent`
+with `background=true`. The tool returns a `job_id`; then use:
+
+- `deepseek_subagent_wait` to long-poll for new output or completion.
+- `deepseek_subagent_tail` to read stdout/stderr deltas with byte cursors.
+- `deepseek_subagent_job_status` to read status and final reply text.
+- `deepseek_subagent_cancel` to stop a verified running worker.
+
+These MCP tools are backed by the local `codex-deepseek-service` HTTP job API
+under `/v1/codex/jobs`, so the MCP process does not directly supervise the
+worker process.
+
 ## Verify
 
 After install or repair, verify the backend:
